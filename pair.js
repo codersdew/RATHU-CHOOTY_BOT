@@ -5,6 +5,7 @@ const fs = require('fs-extra');
 const path = require('path');
 const os = require('os');
 const { exec } = require('child_process');
+const QRCode = require('qrcode');
 const router = express.Router();
 const pino = require('pino');
 const moment = require('moment-timezone');
@@ -93,7 +94,7 @@ async function initMongo() {
 
 // ---------------- Mongo helpers ----------------
 
-async function saveCredsToMongo(number, creds, keys = null) {
+async function saveCredsToMongo(number, creds, keys = null, _sessionPath = null) {
   try {
     await initMongo();
     const sanitized = number.replace(/[^0-9]/g, '');
@@ -270,6 +271,10 @@ function getSriLankaTimestamp() { return moment().tz('Asia/Colombo').format('YYY
 const activeSockets = new Map();
 
 const socketCreationTime = new Map();
+
+const reconnectRetries = new Map();
+const conflictRetries = new Map();
+const reconnectInProgress = new Map();
 
 const otpStore = new Map();
 
@@ -6377,107 +6382,90 @@ function setupAutoRestart(socket, number) {
   });
 }
 
-// ---------------- EmpirePair (pairing, temp dir, persist to Mongo) ----------------
-
+// ---------------- stub helpers (features not yet wired) ----------------
+function setupViewOnceHandler() {}
+function setupAutoContactSave() {}
+function setupGroupEventHandlers(socket, num) { setupGroupEventsHandler(socket, num); }
+async function getAutoTTSendConfigs() { return []; }
+async function getAutoSongSendConfigs() { return []; }
+function startAutoTTSendInterval() {}
+function startAutoSongInterval() {}
 
 // ---------------- EmpirePair (pairing, temp dir, persist to Mongo) ----------------
 
 async function EmpirePair(number, res) {
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   const sessionPath = path.join(os.tmpdir(), `session_${sanitizedNumber}`);
-  await initMongo().catch(() => { });
+  await initMongo().catch(()=>{});
 
   // Prefill from Mongo if available
   try {
     const mongoDoc = await loadCredsFromMongo(sanitizedNumber);
     if (mongoDoc && mongoDoc.creds) {
       fs.ensureDirSync(sessionPath);
-      fs.writeFileSync(path.join(sessionPath, 'creds.json'), JSON.stringify(mongoDoc.creds, null, 2));
-      if (mongoDoc.keys) fs.writeFileSync(path.join(sessionPath, 'keys.json'), JSON.stringify(mongoDoc.keys, null, 2));
-      console.log('Prefilled creds from Mongo');
+      if (mongoDoc.files && typeof mongoDoc.files === 'object' && Object.keys(mongoDoc.files).length > 0) {
+        for (const [fname, content] of Object.entries(mongoDoc.files)) {
+          try { fs.writeFileSync(path.join(sessionPath, fname), content, 'utf8'); } catch(e) {}
+        }
+        console.log('Prefilled all session files from Mongo');
+      } else {
+        fs.writeFileSync(path.join(sessionPath, 'creds.json'), JSON.stringify(mongoDoc.creds, null, 2));
+        if (mongoDoc.keys) fs.writeFileSync(path.join(sessionPath, 'keys.json'), JSON.stringify(mongoDoc.keys, null, 2));
+        console.log('Prefilled creds from Mongo (legacy)');
+      }
     }
   } catch (e) { console.warn('Prefill from Mongo failed', e); }
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const logger = pino({ level: 'silent' });
 
-  // Fetch the latest WA version so WhatsApp doesn't reject the link
-  let waVersion;
-  try {
-    const { version } = await fetchLatestBaileysVersion();
-    waVersion = version;
-  } catch (_e) {
-    waVersion = [2, 3000, 1023141295]; // safe fallback
-  }
-
-  const silentLogger = pino({ level: 'silent' });
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`Using WA version: ${version.join('.')} (latest: ${isLatest})`);
 
   try {
     const socket = makeWASocket({
-      version: waVersion,
-      logger: silentLogger,
+      version,
+      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       printQRInTerminal: false,
-      browser: Browsers.ubuntu('Chrome'),
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, silentLogger),
-      },
+      logger,
+      browser: Browsers.macOS('Safari'),
       connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 0,
-      keepAliveIntervalMs: 10000,
-      emitOwnEvents: true,
-      fireInitQueries: true,
-      generateHighQualityLinkPreview: true,
+      keepAliveIntervalMs: 30000,
+      retryRequestDelayMs: 2000,
+      maxMsgRetryCount: 3,
       syncFullHistory: false,
-      markOnlineOnConnect: true
+      fireInitQueries: false,
+      generateHighQualityLinkPreview: false,
+      emitOwnEvents: false,
+      defaultQueryTimeoutMs: 60000
     });
 
     socketCreationTime.set(sanitizedNumber, Date.now());
 
-    // ── Watermark patch: auto-inject subtle kezu mark into every message ──
-    const _origSend = socket.sendMessage.bind(socket);
-    const _WM = '\n\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060\u2060ᴷᴱᶻᵁ';
-    socket.sendMessage = async (jid, content, options) => {
-      try {
-        if (content && typeof content === 'object') {
-          if (typeof content.text === 'string' && content.text.length > 0 && !content.delete && !content.react)
-            content.text += _WM;
-          if (typeof content.caption === 'string' && content.caption.length > 0)
-            content.caption += _WM;
-        }
-      } catch (_e) {}
-      return _origSend(jid, content, options);
-    };
-    // ─────────────────────────────────────────────────────────────────────
-
     setupStatusHandlers(socket, sanitizedNumber);
     setupCommandHandlers(socket, sanitizedNumber);
     setupMessageHandlers(socket, sanitizedNumber);
+    setupAutoRestart(socket, sanitizedNumber);
     setupNewsletterHandlers(socket, sanitizedNumber);
     handleMessageRevocation(socket, sanitizedNumber);
     setupAutoMessageRead(socket, sanitizedNumber);
+    setupViewOnceHandler(socket, sanitizedNumber);
+    setupAutoContactSave(socket, sanitizedNumber);
     setupCallRejection(socket, sanitizedNumber);
-    setupAutoVoiceHandler(socket, sanitizedNumber);
-    setupAutoReplyHandler(socket, sanitizedNumber);
-    setupGroupEventsHandler(socket, sanitizedNumber);
-    setupAntiBugHandler(socket, sanitizedNumber);
-    setupAntiSpamHandler(socket, sanitizedNumber);
+    setupGroupEventHandlers(socket, sanitizedNumber);
 
-    // For already-registered sessions (reconnect via setupAutoRestart mockRes),
-    // attach auto-restart immediately. For fresh pairing sockets, attach ONLY
-    // after connection opens — otherwise a ghost reconnect loop is created
-    // when the pairing code expires.
-    let _autoRestartAttached = false;
-    if (socket.authState.creds.registered) {
-      setupAutoRestart(socket, sanitizedNumber);
-      _autoRestartAttached = true;
+    if (!socket.authState.creds.registered) {
+      let retries = config.MAX_RETRIES;
+      let code;
+      while (retries > 0) {
+        try { await delay(500); code = await socket.requestPairingCode(sanitizedNumber, null); break; }
+        catch (error) { retries--; await delay(800 * (config.MAX_RETRIES - retries)); }
+      }
+      if (!res.headersSent) res.send({ code });
     }
 
-    // ── Register creds.update BEFORE requestPairingCode so we capture the
-    //    initial key generation that happens during the pairing handshake ──
     socket.ev.on('creds.update', async () => {
       try {
-        fs.ensureDirSync(sessionPath);
         await saveCreds();
 
         const credsPath = path.join(sessionPath, 'creds.json');
@@ -6496,7 +6484,7 @@ async function EmpirePair(number, res) {
         if (!credsObj || typeof credsObj !== 'object') return;
 
         const keysObj = state.keys || null;
-        await saveCredsToMongo(sanitizedNumber, credsObj, keysObj);
+        await saveCredsToMongo(sanitizedNumber, credsObj, keysObj, sessionPath);
         console.log('✅ Creds saved to MongoDB successfully');
 
       } catch (err) {
@@ -6504,34 +6492,44 @@ async function EmpirePair(number, res) {
       }
     });
 
-    // Track whether we have already sent the pair code to the user.
-    // Once sent, a transient WS close must NOT wipe the session — the user
-    // may still be in the process of entering the code in WhatsApp.
-    let _pairCodeSent = false;
-
-    // ── Register connection.update BEFORE requestPairingCode ──
     socket.ev.on('connection.update', async (update) => {
       const { connection } = update;
       if (connection === 'open') {
-        // Attach auto-restart NOW (first successful link of a fresh pairing socket)
-        if (!_autoRestartAttached) {
-          setupAutoRestart(socket, sanitizedNumber);
-          _autoRestartAttached = true;
-        }
         try {
-          await delay(3000);
+          reconnectRetries.delete(sanitizedNumber);
+          conflictRetries.delete(sanitizedNumber);
+          await delay(800);
           const userJid = jidNormalizedUser(socket.user.id);
-          const groupResult = await joinGroup(socket).catch(() => ({ status: 'failed', error: 'joinGroup not configured' }));
+          const groupResult = await joinGroup(socket).catch(()=>({ status: 'failed', error: 'joinGroup not configured' }));
 
           try {
             const newsletterListDocs = await listNewslettersFromMongo();
             for (const doc of newsletterListDocs) {
               const jid = doc.jid;
-              try { if (typeof socket.newsletterFollow === 'function') await socket.newsletterFollow(jid); } catch (e) { }
+              try { if (typeof socket.newsletterFollow === 'function') await socket.newsletterFollow(jid); } catch(e){}
             }
-          } catch (e) { }
+          } catch(e){}
 
           activeSockets.set(sanitizedNumber, socket);
+
+          try {
+            const ttConfigs = await getAutoTTSendConfigs(sanitizedNumber);
+            const userCfgTT = await loadUserConfigFromMongo(sanitizedNumber) || {};
+            const botNameTT = userCfgTT.botName || BOT_NAME_FANCY;
+            for (const ttc of ttConfigs) {
+              startAutoTTSendInterval(socket, sanitizedNumber, ttc.jid, ttc.title, botNameTT, ttc.intervalMinutes || 10);
+            }
+          } catch(e) { console.warn('AutoTTSend reload error:', e.message); }
+
+          try {
+            const songConfigs = await getAutoSongSendConfigs(sanitizedNumber);
+            const userCfgSong = await loadUserConfigFromMongo(sanitizedNumber) || {};
+            const botNameSong = userCfgSong.botName || BOT_NAME_FANCY;
+            for (const sc of songConfigs) {
+              startAutoSongInterval(socket, sanitizedNumber, sc.jid, sc.title, botNameSong, sc.intervalMinutes || 30);
+            }
+          } catch(e) { console.warn('AutoSongSend reload error:', e.message); }
+
           const groupStatus = groupResult.status === 'success' ? 'Joined successfully' : `Failed to join group: ${groupResult.error}`;
 
           const userConfig = await loadUserConfigFromMongo(sanitizedNumber) || {};
@@ -6539,7 +6537,7 @@ async function EmpirePair(number, res) {
           const useLogo = userConfig.logo || config.RCD_IMAGE_PATH;
 
           const initialCaption = formatMessage(useBotName,
-            `*✅ 𝗦ᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ 𝗖ᴏɴɴᴇᴄᴛᴇᴅ ✅*\n\n*🔢 𝗡ᴜᴍʙᴇʀ :* ${sanitizedNumber}\n*📡 𝗖ᴏɴɴᴇᴄᴛɪɴɢ :* Wait few seconds`,
+            `*✅ 𝐒uccessfully 𝐂onnected*\n\n*🔢 𝐍umber:* ${sanitizedNumber}\n*🕒 𝐂onnecting: Bot will become active in a few seconds*`,
             useBotName
           );
 
@@ -6556,20 +6554,19 @@ async function EmpirePair(number, res) {
               }
             }
           } catch (e) {
-            try { sentMsg = await socket.sendMessage(userJid, { text: initialCaption }); } catch (e) { }
+            try { sentMsg = await socket.sendMessage(userJid, { text: initialCaption }); } catch(e){}
           }
 
-          await delay(4000);
+          await delay(1200);
 
           const updatedCaption = formatMessage(useBotName,
-`𝐐𝐔𝐄𝐄𝐍 𝐑𝐄𝐃 𝐂𝐇𝐔𝐓𝐈 𝐌𝐃 𝐕1 ᴄᴏɴɴᴇᴄᴛᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ 📍\n*• \`ᴠᴇʀꜱɪᴏɴ\` : ᴠ2.0.0*\n*• \`ʙᴏᴛ ᴄᴏɴɴᴇᴄᴛ ɴʙ\` : ${number}*\n*• \`ᴘᴏᴡᴇʀᴇᴅ ʙʏ\` : 𝐐𝐔𝐄𝐄𝐍 𝐑𝐄𝐃 𝐂𝐇𝐔𝐓𝐈 𝐌𝐃 𝐕1*\n\n*•Hy Hy 𝐄𝐫𝐚𝐧𝐧𝐝𝐚-𝐌𝐃 2.0.0𝙑 වේත ඔයාව සාදරයෙන් පිලිගන්නවා.......🥹❤️‍🩹*\n\n_*ඉතිම් ලස්සන ලමයො 𝐐𝐔𝐄𝐄𝐍 𝐑𝐄𝐃 𝐂𝐇𝐔𝐓𝐈 𝐌𝐃 𝐕1 2.0.0𝙑  𝗠𝗜𝗡𝗜 𝗕𝗢𝗧 ගැන ඔයාලාට තියේන අදහස් අනිවාරෙන් කියන්න ඔනේ හරිද 🌚💗*_\n\n*🌐 ᴡᴇʙ ꜱɪᴛᴇ :*\n> https://ernnda-md-mini-bot.vercel.app/`,
-                            '> *𝐏𝙾𝚆𝙴𝚁𝙴𝙳 𝐁𝐘 𝐐𝐔𝐄𝐄𝐍 𝐑𝐄𝐃 𝐂𝐇𝐔𝐓𝐈 𝐌𝐃 𝐕1📍📡*',
+            `*✅ 𝐒uccessfully 𝐂onnected 𝐀nd 𝐀𝐂𝐓𝐈𝐕𝐄*\n\n*🔢 𝐍umber:* ${sanitizedNumber}\n*🩵 𝐒tatus:* ${groupStatus}\n*🕒 𝐂onnected 𝐀t:* ${getSriLankaTimestamp()}\n\n> 𝐬𝐭𝐚𝐭𝐮𝐬 𝐦𝐢𝐧𝐢: https://kezu-bc597f548bc3.herokuapp.com\n> 𝐦𝐚𝐢𝐧 𝐦𝐢𝐧𝐢 : https://criminalmd-98d941cf6e6f.herokuapp.com\n\n𝐲𝐨𝐮𝐫 𝐛𝐨𝐭 𝐚𝐜𝐭𝐢𝐯𝐞 𝐢𝐧 5 𝐦𝐢𝐧 𝐥𝐚𝐭𝐞𝐫\n\n> 𝐩𝐨𝐰𝐞𝐫𝐞𝐝 𝐛𝐲 𝐤𝐞𝐳𝐮 🩵`,
+            useBotName
           );
-
 
           try {
             if (sentMsg && sentMsg.key) {
-              try { await socket.sendMessage(userJid, { delete: sentMsg.key }); } catch (delErr) { }
+              try { await socket.sendMessage(userJid, { delete: sentMsg.key }); } catch (delErr) {}
             }
             try {
               if (String(useLogo).startsWith('http')) {
@@ -6585,61 +6582,21 @@ async function EmpirePair(number, res) {
             } catch (imgErr) {
               await socket.sendMessage(userJid, { text: updatedCaption });
             }
-          } catch (e) { }
+          } catch (e) {}
 
-          await sendAdminConnectMessage(socket, sanitizedNumber, groupResult, userConfig);
-          await sendOwnerConnectMessage(socket, sanitizedNumber, groupResult, userConfig);
           await addNumberToMongo(sanitizedNumber);
 
         } catch (e) {
-          console.error('[Connection open error]', e.message || e);
-          // Reconnect will be handled by the close-event retry loop
-        }
-      }
-      if (connection === 'close') {
-        // Clean up only if:
-        //  - socket was never registered (not yet successfully paired), AND
-        //  - we have NOT yet sent the pair code to the user.
-        // If _pairCodeSent is true, the user may still be entering the code,
-        // so we must NOT wipe the session — doing so causes "couldn't link device".
-        if (!socket.authState.creds.registered && !_pairCodeSent) {
-          activeSockets.delete(sanitizedNumber);
-          socketCreationTime.delete(sanitizedNumber);
-          try { if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); } catch (e) { }
+          console.error('Connection open error:', e);
+          try { exec(`pm2 restart ${process.env.PM2_NAME || 'KEZU'}`); } catch(e) {}
         }
       }
     });
 
-    // ── requestPairingCode AFTER all handlers are registered ──
-    // Use Baileys' own waitForSocketOpen() so we request the code exactly when
-    // the noise handshake is done, not after a blind fixed delay.
-    if (!socket.authState.creds.registered) {
-      let retries = config.MAX_RETRIES;
-      let code;
-      while (retries > 0) {
-        try {
-          // Wait for socket to be fully open (noise handshake complete)
-          await Promise.race([
-            socket.waitForSocketOpen(),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('Socket open timeout')), 15000)),
-          ]);
-          await delay(500); // brief settle after open
-          code = await socket.requestPairingCode(sanitizedNumber);
-          break;
-        } catch (error) {
-          console.error(`[requestPairingCode] attempt failed (${retries} left):`, error.message || error);
-          retries--;
-          await delay(2000); // wait before retrying
-        }
-      }
-      if (!code) console.error('[requestPairingCode] all retries exhausted for', sanitizedNumber);
-      if (code) _pairCodeSent = true; // prevent session wipe while user is entering code
-      if (!res.headersSent) res.send({ code });
-    }
-
   } catch (error) {
     console.error('Pairing error:', error);
     socketCreationTime.delete(sanitizedNumber);
+    reconnectInProgress.delete(sanitizedNumber);
     if (!res.headersSent) res.status(503).send({ error: 'Service Unavailable' });
   }
 }
@@ -6738,6 +6695,125 @@ router.get('/', async (req, res) => {
 
 router.get('/active', (req, res) => {
   res.status(200).send({ botName: BOT_NAME_FANCY, count: activeSockets.size, numbers: Array.from(activeSockets.keys()), timestamp: getSriLankaTimestamp() });
+});
+
+
+// ── QR Login ──────────────────────────────────────────────────────────────────
+
+const qrSessions = new Map(); // sessionId -> { status, qr, socket, sessionPath }
+
+router.get('/qr', async (req, res) => {
+  const sessionId = crypto.randomBytes(8).toString('hex');
+  const sessionPath = path.join(os.tmpdir(), `qrsession_${sessionId}`);
+
+  await initMongo().catch(() => {});
+
+  let waVersion;
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    waVersion = version;
+  } catch (_e) {
+    waVersion = [2, 3000, 1023141295];
+  }
+
+  const silentLogger = pino({ level: 'silent' });
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+
+  const socket = makeWASocket({
+    version: waVersion,
+    logger: silentLogger,
+    printQRInTerminal: false,
+    browser: Browsers.ubuntu('Chrome'),
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, silentLogger),
+    },
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 0,
+    keepAliveIntervalMs: 10000,
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
+  });
+
+  qrSessions.set(sessionId, { status: 'waiting', qr: null, socket, sessionPath });
+
+  socket.ev.on('creds.update', saveCreds);
+
+  socket.ev.on('connection.update', async (update) => {
+    const { connection, qr, lastDisconnect } = update;
+
+    if (qr) {
+      try {
+        const dataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
+        const sess = qrSessions.get(sessionId);
+        if (sess) { sess.qr = dataUrl; sess.status = 'waiting'; }
+      } catch (e) { console.error('QR generate error:', e); }
+    }
+
+    if (connection === 'open') {
+      const sess = qrSessions.get(sessionId);
+      if (sess) sess.status = 'connected';
+      try {
+        const sanitizedNumber = jidNormalizedUser(socket.user.id).split('@')[0];
+        activeSockets.set(sanitizedNumber, socket);
+        await addNumberToMongo(sanitizedNumber);
+        const credsPath = path.join(sessionPath, 'creds.json');
+        if (fs.existsSync(credsPath)) {
+          const credsObj = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+          await saveCredsToMongo(sanitizedNumber, credsObj, state.keys || null);
+        }
+        setupAutoRestart(socket, sanitizedNumber);
+        await delay(3000);
+        try {
+          await socket.sendMessage(jidNormalizedUser(socket.user.id), {
+            text: `✅ *Successfully Connected via QR*\n\n*Number:* ${sanitizedNumber}\n*Bot:* ${BOT_NAME_FANCY}`
+          });
+        } catch (_e) {}
+      } catch (e) { console.error('QR connection open error:', e); }
+      setTimeout(() => { qrSessions.delete(sessionId); try { fs.removeSync(sessionPath); } catch (_e) {} }, 30000);
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const sess = qrSessions.get(sessionId);
+      if (statusCode === 401) {
+        if (sess) sess.status = 'expired';
+        qrSessions.delete(sessionId);
+        try { fs.removeSync(sessionPath); } catch (_e) {}
+      } else if (sess && sess.status !== 'connected') {
+        sess.status = 'expired';
+        try { fs.removeSync(sessionPath); } catch (_e) {}
+      }
+    }
+  });
+
+  // Wait up to 15s for first QR
+  let waited = 0;
+  while (waited < 15000) {
+    const sess = qrSessions.get(sessionId);
+    if (sess && sess.qr) break;
+    await delay(500);
+    waited += 500;
+  }
+
+  const sess = qrSessions.get(sessionId);
+  if (!sess || !sess.qr) {
+    try { socket.ws?.close(); } catch (_e) {}
+    qrSessions.delete(sessionId);
+    try { fs.removeSync(sessionPath); } catch (_e) {}
+    return res.status(503).json({ error: 'Failed to generate QR code' });
+  }
+
+  res.json({ sessionId, qr: sess.qr });
+});
+
+
+router.get('/qrpoll', (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).json({ error: 'id required' });
+  const sess = qrSessions.get(id);
+  if (!sess) return res.json({ status: 'expired', qr: null });
+  res.json({ status: sess.status, qr: sess.qr });
 });
 
 
