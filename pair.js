@@ -5,7 +5,6 @@ const fs = require('fs-extra');
 const path = require('path');
 const os = require('os');
 const { exec } = require('child_process');
-const QRCode = require('qrcode');
 const router = express.Router();
 const pino = require('pino');
 const moment = require('moment-timezone');
